@@ -34,7 +34,7 @@ ORDERING_CONFIGS = [
 
 def _tepig(task, n_train, n_test, r=30, seed=0, **kwargs):
     X, y = sample_task(task, r, n_train + n_test, rng=seed)
-    return TEPIG_Regression(KNN, X, y, n_train=n_train, n_test=n_test, return_full=True, **kwargs)
+    return TEPIG_Regression(X, y, model=KNN, n_train=n_train, n_test=n_test, return_full=True, **kwargs)
 
 
 def _clearly_below(a, b, n_se=2.0):

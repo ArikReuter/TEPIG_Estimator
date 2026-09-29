@@ -53,6 +53,30 @@ class RegressionModel(Protocol):
         ...
 
 
+@runtime_checkable
+class PrefixRegressionModel(RegressionModel, Protocol):
+    """A RegressionModel that can also predict from a prefix of one sequence.
+
+    TEPIG estimators evaluate growing prefixes of the same shuffled sequence.
+    If a model has this method, they call it instead of ``predict_distribution``,
+    so the model can reuse work across context sizes, e.g. a distance matrix.
+    """
+
+    def predict_distribution_prefix(
+        self,
+        X_sequence: np.ndarray,  # shape (n_rows, n_features); rows [:n_context] are the context
+        y_context: np.ndarray,   # shape (n_context,); query labels are never passed
+        random_state: int,
+    ) -> RegressionPrediction:
+        """Return the same as ``predict_distribution(X_sequence[:n_context], y_context,
+        X_sequence[n_context:], random_state)`` with ``n_context = len(y_context)``.
+
+        Implementations may cache state keyed on the identity of ``X_sequence``; callers
+        must not modify ``X_sequence`` in place between calls.
+        """
+        ...
+
+
 class RegressionLoss(Protocol):
     """A per-point loss computed from a prediction and the true query targets."""
 

@@ -6,14 +6,15 @@ import warnings
 
 import numpy as np
 
+from CustomizedModels.KNN import KNNv2
 from interfaces import RegressionLoss, RegressionModel
 from losses import resolve_loss
 
 
 def TEPIG_Regression(
-    model: RegressionModel,
     set_of_datasets_X: np.ndarray,  # shape (r, n_train + n_test, n_features)
     set_of_datasets_y: np.ndarray,  # shape (r, n_train + n_test)
+    model: RegressionModel | None = None,  # default: CustomizedModels.KNN.KNNv2()
     n_train: int | None = None,     # default: set_of_datasets_X.shape[1] // 2
     n_test: int | None = None,      # default: set_of_datasets_X.shape[1] - n_train
     loss: str | RegressionLoss = "mse",
@@ -41,10 +42,6 @@ def TEPIG_Regression(
     ``k = n_train`` these are exactly the query rows.
 
     Args:
-        model: Predictor q following ``interfaces.RegressionModel``: its
-            ``predict_distribution(X_context, y_context, X_query, random_state)``
-            returns a ``RegressionPrediction`` providing the fields ``loss``
-            needs.
         set_of_datasets_X: Inputs of shape ``(r, n_train + n_test, n_features)``:
             ``r`` data sets, all drawn i.i.d. from the same task theta. Rows
             ``[:n_train]`` of each data set form the context and rows
@@ -55,6 +52,12 @@ def TEPIG_Regression(
             is raised.
         set_of_datasets_y: Targets of shape ``(r, n_train + n_test)``, aligned
             with ``set_of_datasets_X``.
+        model: Predictor q following ``interfaces.RegressionModel``: its
+            ``predict_distribution(X_context, y_context, X_query, random_state)``
+            returns a ``RegressionPrediction`` providing the fields ``loss``
+            needs. Defaults to a fresh ``KNNv2()`` (adaptive-K tricube
+            nearest neighbours), which only predicts means, so pair it with
+            ``loss="mse"``.
         n_train: Context size to consider, defaults to ``set_of_datasets_X.shape[1] // 2``.
         n_test: Number of query points. Defaults to ``set_of_datasets_X.shape[1] - n_train``.
         min_context_size: First context size in the sum; must be below
@@ -83,6 +86,8 @@ def TEPIG_Regression(
         The TEPIG estimate averaged over the ``r`` data sets, or the full
         result dict if ``return_full``.
     """
+    if model is None:
+        model = KNNv2()
     if not isinstance(model, RegressionModel):
         raise TypeError(
             f"model must follow interfaces.RegressionModel (a predict_distribution method); "
@@ -129,6 +134,9 @@ def TEPIG_Regression(
         groups = _context_size_groups(context_sizes, group_size)
     position = {k: i for i, k in enumerate(context_sizes)}
 
+    # Prefix-capable models (interfaces.PrefixRegressionModel) reuse work across context sizes.
+    predict_prefix = getattr(model, "predict_distribution_prefix", None)
+
     rng = np.random.default_rng(random_state)
     progress = None
     if show_progress_bar:
@@ -142,7 +150,10 @@ def TEPIG_Regression(
             X_seq, y_seq = X[j, order], y[j, order]
             for rep, members in groups:
                 seed = int(rng.integers(0, 2**31 - 1))
-                prediction = model.predict_distribution(X_seq[:rep], y_seq[:rep], X_seq[rep:], seed)
+                if predict_prefix is not None:
+                    prediction = predict_prefix(X_seq, y_seq[:rep], seed)
+                else:
+                    prediction = model.predict_distribution(X_seq[:rep], y_seq[:rep], X_seq[rep:], seed)
                 point_losses = np.asarray(loss_fn(prediction, y_seq[rep:]), dtype=float)
                 if point_losses.shape != (len(y_seq) - rep,):
                     raise ValueError(
