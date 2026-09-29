@@ -15,7 +15,7 @@ sys.path[:0] = [ROOT, os.path.join(ROOT, "tests")]
 
 from CustomizedModels.KNN import KNNv2  # noqa: E402
 from interfaces import PrefixRegressionModel  # noqa: E402
-from TEPIG import TEPIG_Regression  # noqa: E402
+from TEPIG import TEPIG_Regression, TEPIG_Regression_KNN, _tepig_knn  # noqa: E402
 from toy_tasks import sample_task  # noqa: E402
 
 CONFIGS = [dict(), dict(weights="uniform"), dict(n_neighbors=5), dict(n_neighbors=40, weights="uniform")]
@@ -54,6 +54,26 @@ def test_tepig_identical_with_and_without_cache():
         a = TEPIG_Regression(X, y, model=KNNv2(), return_full=True, **kwargs)["tepig_per_dataset"]
         b = TEPIG_Regression(X, y, model=KNNv2(cache_distances=False), return_full=True, **kwargs)["tepig_per_dataset"]
         assert np.array_equal(a, b), kwargs
+
+
+def test_batched_knn_tepig_matches_tepig_regression():
+    """TEPIG_Regression_KNN is TEPIG_Regression with KNNv2, MSE, group size 1 and min context 1, batched."""
+    X, y = sample_task("sinusoid", 3, 100, rng=4)
+    for kwargs in [dict(), dict(assume_predictive_convergence=True), dict(n_orderings=3), dict(n_train=30, n_test=70)]:
+        kwargs = {"n_orderings": 2, **kwargs}
+        a = TEPIG_Regression(X, y, model=KNNv2(), assume_predictive_convergence=kwargs.pop("assume_predictive_convergence", False),
+                             return_full=True, **kwargs)
+        b = TEPIG_Regression_KNN(X, y, assume_predictive_convergence=a["assume_predictive_convergence"],
+                                 return_full=True, **kwargs)
+        assert np.allclose(a["loss_curve_per_dataset"], b["loss_curve_per_dataset"], rtol=0, atol=1e-12), kwargs
+        assert np.isclose(a["tepig"], b["tepig"], rtol=1e-12), kwargs
+
+
+def test_batched_engine_is_chunk_invariant():
+    X, y = sample_task("line", 5, 80, rng=5)
+    a = _tepig_knn(X, y, n_orderings=2, return_full=True)["loss_curve_per_dataset"]
+    b = _tepig_knn(X, y, n_orderings=2, return_full=True, max_chunk_bytes=1)["loss_curve_per_dataset"]
+    assert np.allclose(a, b, rtol=0, atol=1e-12)
 
 
 def test_knnv2_is_the_default_model():

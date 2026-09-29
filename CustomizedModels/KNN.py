@@ -67,6 +67,122 @@ class _NeighbourLists:
         self.size = k
 
 
+def _weighted_neighbour_mean(dist, nb_y, K, k, weights):
+    """KNNv2 predictions from sorted neighbour distances and labels, one K per row (as ``KNNv2._predict``)."""
+    n_fetch = min(int(K.max()) + 1, k)
+    dist, nb_y = dist[:, :n_fetch], nb_y[:, :n_fetch]
+    valid = np.arange(n_fetch) < K[:, None]
+    if weights == "uniform":
+        return (nb_y * valid).sum(axis=1) / valid.sum(axis=1)
+    # Bandwidth: distance to neighbour K+1, or to the farthest one if only K exist.
+    bandwidth = np.take_along_axis(dist, np.minimum(K, k - 1)[:, None], axis=1)
+    ratio = np.minimum(dist / np.maximum(bandwidth, 1e-12), 1.0)
+    w = np.clip(1.0 - ratio**3, 0.0, None) ** 3 * valid
+    denom = w.sum(axis=1)
+    pred = (w * nb_y).sum(axis=1) / np.maximum(denom, 1e-12)
+    all_zero = denom <= 0.0
+    if all_zero.any():
+        pred[all_zero] = (nb_y[all_zero] * valid[all_zero]).sum(axis=1) / valid[all_zero].sum(axis=1)
+    return pred
+
+
+def knnv2_loss_curves(
+    X_sequences: np.ndarray,  # shape (B, n_rows, n_features)
+    y_sequences: np.ndarray,  # shape (B, n_rows)
+    context_sizes,            # increasing ints in [1, n_rows)
+    n_neighbors: int | None = None,
+    weights: str = "tricube",
+    k_max: int = 30,
+    progress=None,
+) -> np.ndarray:
+    """KNNv2 mean squared error on rows ``k:`` given rows ``:k``, for every sequence and ``k``.
+
+    Returns shape ``(B, len(context_sizes))``. Equals ``KNNv2`` applied to each
+    sequence separately (each sequence uses its own K), but processes all
+    sequences at once and never repeats work: rows join the context one at a
+    time, each row's nearest context rows are updated from the new row's
+    distances (no distance matrix is stored), and leave-one-out errors and query
+    predictions are recomputed only for rows whose neighbour list changed (or,
+    for predictions, whose sequence's K changed). ``progress`` (e.g. a tqdm bar)
+    is advanced once per row added.
+    """
+    if weights not in ("uniform", "tricube"):
+        raise ValueError(f"weights must be 'uniform' or 'tricube', got {weights!r}")
+    X = np.asarray(X_sequences, dtype=np.float64)
+    y = np.asarray(y_sequences, dtype=np.float64)
+    B, n_rows, _ = X.shape
+    sizes = [int(k) for k in context_sizes]
+    if any(b <= a for a, b in zip(sizes, sizes[1:])) or sizes[0] < 1 or sizes[-1] >= n_rows:
+        raise ValueError(f"context_sizes must increase within [1, {n_rows}); got {sizes[0]}..{sizes[-1]}.")
+    adaptive = n_neighbors is None
+
+    # Neighbour lists: each row's n_keep nearest rows within the current context (never itself).
+    n_keep = (k_max if adaptive else max(1, n_neighbors)) + 1
+    sq_norms = (X * X).sum(axis=2)
+    nb_idx = np.zeros((B, n_rows, n_keep), dtype=np.int64)
+    nb_dist = np.full((B, n_rows, n_keep), np.inf)
+    flat_idx, flat_dist = nb_idx.reshape(-1, n_keep), nb_dist.reshape(-1, n_keep)
+    cols = np.arange(n_keep)
+
+    # Leave-one-out squared error of every context row for K = 1..k_max, and their per-sequence sums.
+    loo_err = np.zeros((B, n_rows, k_max if adaptive else 0))
+    loo_sum = np.zeros((B, k_max if adaptive else 0))
+    loo_stale = np.ones((B, n_rows), dtype=bool)   # list changed since loo_err was computed
+    loo_counted = np.zeros((B, n_rows), dtype=bool)
+    # Cached query predictions and the K they were made with.
+    pred = np.zeros((B, n_rows))
+    pred_stale = np.ones((B, n_rows), dtype=bool)
+    pred_K = np.full(B, -1)
+
+    out = np.empty((B, len(sizes)))
+    p = 0
+    for s, k in enumerate(sizes):
+        while p < k:  # row p joins every sequence's context
+            d = sq_norms + sq_norms[:, p:p + 1] - 2.0 * np.einsum("bnf,bf->bn", X, X[:, p])
+            d = np.sqrt(np.maximum(d, 0.0))
+            d[:, p] = np.inf
+            d = d.ravel()
+            rows = np.flatnonzero(d < flat_dist[:, -1])
+            if rows.size:
+                d_rows, old_d, old_i = d[rows, None], flat_dist[rows], flat_idx[rows]
+                pos = (old_d <= d_rows).sum(axis=1, keepdims=True)  # after equal distances: lower index first
+                shifted_d = np.concatenate([old_d[:, :1], old_d[:, :-1]], axis=1)
+                shifted_i = np.concatenate([old_i[:, :1], old_i[:, :-1]], axis=1)
+                flat_dist[rows] = np.where(cols < pos, old_d, np.where(cols == pos, d_rows, shifted_d))
+                flat_idx[rows] = np.where(cols < pos, old_i, np.where(cols == pos, p, shifted_i))
+                loo_stale.reshape(-1)[rows] = True
+                pred_stale.reshape(-1)[rows] = True
+            p += 1
+            if progress is not None:
+                progress.update()
+
+        if not adaptive:
+            K = np.full(B, max(1, min(n_neighbors, k)))
+        elif k < 2:
+            K = np.ones(B, dtype=np.int64)
+        else:  # K minimising the summed leave-one-out error, as KNNv2._loo_select_k
+            b_i, r_i = np.nonzero(loo_stale[:, :k] | ~loo_counted[:, :k])
+            if b_i.size:
+                nb_y = y[b_i[:, None], nb_idx[b_i, r_i, :k_max]]
+                new = (y[b_i, r_i][:, None] - np.cumsum(nb_y, axis=1) / np.arange(1, k_max + 1)) ** 2
+                old = np.where(loo_counted[b_i, r_i][:, None], loo_err[b_i, r_i], 0.0)
+                np.add.at(loo_sum, b_i, new - old)
+                loo_err[b_i, r_i] = new
+                loo_counted[b_i, r_i] = True
+                loo_stale[b_i, r_i] = False
+            K = np.argmin(loo_sum[:, :min(k_max, k - 1)], axis=1) + 1
+
+        b_q, q = np.nonzero(pred_stale[:, k:] | (K != pred_K)[:, None])
+        if b_q.size:
+            q = q + k
+            pred[b_q, q] = _weighted_neighbour_mean(nb_dist[b_q, q], y[b_q[:, None], nb_idx[b_q, q]],
+                                                    K[b_q], k, weights)
+            pred_stale[b_q, q] = False
+        pred_K = K
+        out[:, s] = ((y[:, k:] - pred[:, k:]) ** 2).mean(axis=1)
+    return out
+
+
 class KNNv2:
     """Nearest-neighbour mean predictor following ``interfaces.PrefixRegressionModel``.
 
